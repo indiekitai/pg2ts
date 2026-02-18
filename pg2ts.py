@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""
+pg2ts - Generate TypeScript types from PostgreSQL schemas
+
+A lightweight CLI tool to sync your database schema with TypeScript interfaces.
+No runtime dependencies, just pure type generation.
+
+Usage:
+    pg2ts --host localhost --db mydb --user postgres --output types.ts
+    pg2ts --url "postgresql://user:pass@host:5432/db" --output types.ts
+"""
+
+import argparse
+import sys
+from typing import Optional
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    print("Error: psycopg2 not installed. Run: pip install psycopg2-binary")
+    sys.exit(1)
+
+
+# PostgreSQL to TypeScript type mapping
+PG_TO_TS = {
+    # Numeric types
+    "smallint": "number",
+    "integer": "number",
+    "bigint": "number",
+    "int2": "number",
+    "int4": "number",
+    "int8": "number",
+    "decimal": "number",
+    "numeric": "number",
+    "real": "number",
+    "double precision": "number",
+    "float4": "number",
+    "float8": "number",
+    "serial": "number",
+    "bigserial": "number",
+    "smallserial": "number",
+    
+    # Boolean
+    "boolean": "boolean",
+    "bool": "boolean",
+    
+    # String types
+    "character varying": "string",
+    "varchar": "string",
+    "character": "string",
+    "char": "string",
+    "text": "string",
+    "citext": "string",
+    "uuid": "string",
+    "name": "string",
+    
+    # Date/Time
+    "timestamp": "string",
+    "timestamp without time zone": "string",
+    "timestamp with time zone": "string",
+    "timestamptz": "string",
+    "date": "string",
+    "time": "string",
+    "time without time zone": "string",
+    "time with time zone": "string",
+    "timetz": "string",
+    "interval": "string",
+    
+    # JSON
+    "json": "unknown",
+    "jsonb": "unknown",
+    
+    # Binary
+    "bytea": "Buffer",
+    
+    # Network
+    "inet": "string",
+    "cidr": "string",
+    "macaddr": "string",
+    
+    # Arrays will be handled specially
+}
+
+
+@dataclass
+class Column:
+    name: str
+    data_type: str
+    is_nullable: bool
+    column_default: Optional[str]
+    is_array: bool = False
+
+
+@dataclass
+class Table:
+    schema: str
+    name: str
+    columns: list[Column]
+
+
+def snake_to_pascal(name: str) -> str:
+    """Convert snake_case to PascalCase."""
+    return "".join(word.capitalize() for word in name.split("_"))
+
+
+def get_ts_type(pg_type: str, is_array: bool = False) -> str:
+    """Convert PostgreSQL type to TypeScript type."""
+    # Handle array types
+    if pg_type.startswith("_"):
+        pg_type = pg_type[1:]
+        is_array = True
+    
+    # Handle ARRAY suffix
+    if pg_type.endswith("[]"):
+        pg_type = pg_type[:-2]
+        is_array = True
+    
+    ts_type = PG_TO_TS.get(pg_type.lower(), "unknown")
+    
+    if is_array:
+        return f"{ts_type}[]"
+    return ts_type
+
+
+def fetch_tables(conn, schemas: list[str]) -> list[Table]:
+    """Fetch all tables and their columns from the database."""
+    tables = []
+    
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Get all tables
+        cur.execute("""
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_type = 'BASE TABLE'
+              AND table_schema = ANY(%s)
+            ORDER BY table_schema, table_name
+        """, (schemas,))
+        
+        table_rows = cur.fetchall()
+        
+        for row in table_rows:
+            schema = row["table_schema"]
+            table_name = row["table_name"]
+            
+            # Get columns for this table
+            cur.execute("""
+                SELECT 
+                    column_name,
+                    data_type,
+                    udt_name,
+                    is_nullable,
+                    column_default
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+            """, (schema, table_name))
+            
+            columns = []
+            for col in cur.fetchall():
+                # Use udt_name for better type detection (handles arrays)
+                data_type = col["udt_name"]
+                is_array = data_type.startswith("_")
+                
+                columns.append(Column(
+                    name=col["column_name"],
+                    data_type=data_type,
+                    is_nullable=col["is_nullable"] == "YES",
+                    column_default=col["column_default"],
+                    is_array=is_array
+                ))
+            
+            tables.append(Table(
+                schema=schema,
+                name=table_name,
+                columns=columns
+            ))
+    
+    return tables
+
+
+def generate_typescript(tables: list[Table], include_schema: bool = False) -> str:
+    """Generate TypeScript interfaces from tables."""
+    lines = [
+        "// Auto-generated by pg2ts",
+        "// https://github.com/indiekitai/pg2ts",
+        "// Do not edit manually!",
+        "",
+    ]
+    
+    for table in tables:
+        # Interface name
+        if include_schema and table.schema != "public":
+            interface_name = f"{snake_to_pascal(table.schema)}{snake_to_pascal(table.name)}"
+        else:
+            interface_name = snake_to_pascal(table.name)
+        
+        lines.append(f"export interface {interface_name} {{")
+        
+        for col in table.columns:
+            ts_type = get_ts_type(col.data_type, col.is_array)
+            optional = "?" if col.is_nullable else ""
+            
+            # Add comment for complex types
+            if ts_type == "unknown":
+                lines.append(f"  /** PostgreSQL type: {col.data_type} */")
+            
+            lines.append(f"  {col.name}{optional}: {ts_type};")
+        
+        lines.append("}")
+        lines.append("")
+    
+    # Add helper types
+    lines.extend([
+        "// Helper types for insert/update operations",
+        "",
+    ])
+    
+    for table in tables:
+        if include_schema and table.schema != "public":
+            interface_name = f"{snake_to_pascal(table.schema)}{snake_to_pascal(table.name)}"
+        else:
+            interface_name = snake_to_pascal(table.name)
+        
+        # Generate Insert type (required fields only)
+        required_cols = [c for c in table.columns if not c.is_nullable and c.column_default is None]
+        optional_cols = [c for c in table.columns if c.is_nullable or c.column_default is not None]
+        
+        if required_cols or optional_cols:
+            lines.append(f"export type {interface_name}Insert = {{")
+            for col in required_cols:
+                ts_type = get_ts_type(col.data_type, col.is_array)
+                lines.append(f"  {col.name}: {ts_type};")
+            for col in optional_cols:
+                ts_type = get_ts_type(col.data_type, col.is_array)
+                lines.append(f"  {col.name}?: {ts_type};")
+            lines.append("};")
+            lines.append("")
+    
+    return "\n".join(lines)
+
+
+def parse_connection_url(url: str) -> dict:
+    """Parse PostgreSQL connection URL."""
+    parsed = urlparse(url)
+    return {
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 5432,
+        "database": parsed.path.lstrip("/") or "postgres",
+        "user": parsed.username or "postgres",
+        "password": parsed.password or "",
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate TypeScript types from PostgreSQL schemas",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  pg2ts --url "postgresql://user:pass@localhost:5432/mydb" -o types.ts
+  pg2ts -H localhost -d mydb -U postgres -o types.ts
+  pg2ts --url "..." --schemas public,app -o types.ts
+        """,
+    )
+    
+    # Connection options
+    conn_group = parser.add_argument_group("Connection")
+    conn_group.add_argument("--url", help="PostgreSQL connection URL")
+    conn_group.add_argument("-H", "--host", default="localhost", help="Database host")
+    conn_group.add_argument("-p", "--port", type=int, default=5432, help="Database port")
+    conn_group.add_argument("-d", "--database", help="Database name")
+    conn_group.add_argument("-U", "--user", default="postgres", help="Database user")
+    conn_group.add_argument("-W", "--password", default="", help="Database password")
+    
+    # Output options
+    output_group = parser.add_argument_group("Output")
+    output_group.add_argument("-o", "--output", help="Output file (default: stdout)")
+    output_group.add_argument("--schemas", default="public", help="Comma-separated schemas (default: public)")
+    output_group.add_argument("--include-schema", action="store_true", help="Include schema name in interface names")
+    
+    args = parser.parse_args()
+    
+    # Build connection params
+    if args.url:
+        conn_params = parse_connection_url(args.url)
+    else:
+        if not args.database:
+            parser.error("--database is required when not using --url")
+        conn_params = {
+            "host": args.host,
+            "port": args.port,
+            "database": args.database,
+            "user": args.user,
+            "password": args.password,
+        }
+    
+    # Parse schemas
+    schemas = [s.strip() for s in args.schemas.split(",")]
+    
+    # Connect and fetch schema
+    try:
+        conn = psycopg2.connect(**conn_params)
+        tables = fetch_tables(conn, schemas)
+        conn.close()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    if not tables:
+        print("No tables found in specified schemas.", file=sys.stderr)
+        sys.exit(1)
+    
+    # Generate TypeScript
+    output = generate_typescript(tables, args.include_schema)
+    
+    # Write output
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(output)
+        print(f"✓ Generated {len(tables)} interfaces → {args.output}")
+    else:
+        print(output)
+
+
+if __name__ == "__main__":
+    main()

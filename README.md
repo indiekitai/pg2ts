@@ -7,7 +7,9 @@ Generate TypeScript types from your PostgreSQL database schema. Zero runtime ove
 - **No runtime dependencies** — Types are generated at build time
 - **Lightweight** — Single file, no complex setup
 - **Practical** — Also generates `Insert` types with proper optional fields
+- **Enum Support** — PostgreSQL enums become TypeScript union types
 - **Zod Support** — Generate runtime-validated Zod schemas
+- **Drizzle ORM** — Generate complete Drizzle schema with relations
 - **JSDoc Comments** — Preserves PostgreSQL COMMENT as JSDoc
 - **Agent-Friendly** — JSON output for automation pipelines
 - **Watch Mode** — Auto-regenerate on schema changes
@@ -37,10 +39,13 @@ pip install psycopg2-binary
 Given this table:
 
 ```sql
+CREATE TYPE status AS ENUM ('active', 'inactive', 'pending');
+
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
     email VARCHAR(255) NOT NULL,
     name TEXT,
+    status status DEFAULT 'active',
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -52,6 +57,10 @@ COMMENT ON COLUMN users.email IS 'User email address';
 You get:
 
 ```typescript
+// Enum types
+export type Status = 'active' | 'inactive' | 'pending';
+export const StatusValues = ['active', 'inactive', 'pending'] as const;
+
 /** User account information */
 export interface Users {
   /** Primary key */
@@ -59,6 +68,7 @@ export interface Users {
   /** User email address */
   email: string;
   name?: string;
+  status?: Status;  // Uses the enum type!
   created_at?: string;
 }
 
@@ -68,11 +78,110 @@ export type UsersInsert = {
   /** Primary key */
   id?: number;
   name?: string;
+  status?: Status;
   created_at?: string;
 };
 ```
 
 ## Features
+
+### Enum Support
+
+PostgreSQL enums are automatically converted to TypeScript union types:
+
+```sql
+CREATE TYPE status AS ENUM ('active', 'inactive', 'pending');
+CREATE TYPE priority AS ENUM ('low', 'medium', 'high');
+```
+
+Generated TypeScript:
+
+```typescript
+// Enum types
+export type Status = 'active' | 'inactive' | 'pending';
+export const StatusValues = ['active', 'inactive', 'pending'] as const;
+
+export type Priority = 'low' | 'medium' | 'high';
+export const PriorityValues = ['low', 'medium', 'high'] as const;
+
+// In interfaces, columns use the enum type
+export interface Tasks {
+  id: number;
+  status: Status;      // Not string!
+  priority: Priority;  // Not string!
+}
+```
+
+With `--zod` flag, enums also get Zod schemas:
+
+```typescript
+export type Status = 'active' | 'inactive' | 'pending';
+export const StatusValues = ['active', 'inactive', 'pending'] as const;
+export const StatusSchema = z.enum(['active', 'inactive', 'pending']);
+```
+
+### Drizzle ORM Schema Generation (`--drizzle`)
+
+Generate a complete Drizzle ORM schema instead of plain interfaces:
+
+```bash
+./pg2ts.py --url "..." --drizzle -o schema.ts
+```
+
+Output:
+
+```typescript
+import { pgTable, pgEnum, serial, text, varchar, integer, timestamp, boolean } from 'drizzle-orm/pg-core';
+
+// Enums
+export const statusEnum = pgEnum('status', ['active', 'inactive', 'pending']);
+
+// Tables
+export const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  email: varchar('email', { length: 255 }).notNull(),
+  name: text('name'),
+  status: statusEnum('status').default('active'),
+  createdAt: timestamp('created_at').defaultNow(),
+});
+
+export const posts = pgTable('posts', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id').references(() => users.id),
+  title: text('title').notNull(),
+  published: boolean('published').default(false),
+});
+
+// Inferred types
+export type Users = typeof users.$inferSelect;
+export type UsersInsert = typeof users.$inferInsert;
+export type Posts = typeof posts.$inferSelect;
+export type PostsInsert = typeof posts.$inferInsert;
+```
+
+**Drizzle type mapping:**
+
+| PostgreSQL | Drizzle |
+|------------|---------|
+| serial | serial() |
+| integer, int4 | integer() |
+| bigint, int8 | bigint({ mode: 'number' }) |
+| varchar(n) | varchar('col', { length: n }) |
+| text | text() |
+| boolean | boolean() |
+| timestamp, timestamptz | timestamp() |
+| date | date() |
+| json | json() |
+| jsonb | jsonb() |
+| uuid | uuid() |
+| numeric(p,s) | numeric({ precision: p, scale: s }) |
+
+**Drizzle features:**
+- Primary keys → `.primaryKey()`
+- NOT NULL → `.notNull()`
+- DEFAULT values → `.default()` / `.defaultNow()` / `.defaultRandom()`
+- Foreign keys → `.references(() => table.column)`
+- Enums → `pgEnum()` definitions
 
 ### Zod Schema Generation (`--zod`)
 
@@ -87,6 +196,11 @@ Output:
 ```typescript
 import { z } from 'zod';
 
+// Enum types
+export type Status = 'active' | 'inactive' | 'pending';
+export const StatusValues = ['active', 'inactive', 'pending'] as const;
+export const StatusSchema = z.enum(['active', 'inactive', 'pending']);
+
 /** User account information */
 export const UsersSchema = z.object({
   /** Primary key */
@@ -94,6 +208,7 @@ export const UsersSchema = z.object({
   /** User email address */
   email: z.string(),
   name: z.string().nullable(),
+  status: StatusSchema.nullable(),
   created_at: z.string().nullable(),
 });
 
@@ -105,6 +220,7 @@ export const UsersInsertSchema = z.object({
   /** Primary key */
   id: z.number().optional(),
   name: z.string().nullable().optional(),
+  status: StatusSchema.nullable().optional(),
   created_at: z.string().nullable().optional(),
 });
 
@@ -130,7 +246,7 @@ Output:
 ```typescript
 export const usersTable = {
   tableName: 'users',
-  columns: ['id', 'email', 'name', 'created_at'] as const,
+  columns: ['id', 'email', 'name', 'status', 'created_at'] as const,
   requiredForInsert: ['email'] as const,
 } as const;
 
@@ -155,12 +271,16 @@ Output:
     {
       "name": "users",
       "schema": "public",
-      "columns": ["id", "email", "name", "created_at"],
+      "columns": ["id", "email", "name", "status", "created_at"],
       "required": ["email"],
-      "optional": ["id", "name", "created_at"],
+      "optional": ["id", "name", "status", "created_at"],
       "comment": "User account information"
     }
   ],
+  "enums": [
+    {"name": "status", "values": ["active", "inactive", "pending"]}
+  ],
+  "enums_count": 1,
   "types_generated": 2,
   "output_file": "types.ts"
 }
@@ -188,7 +308,7 @@ COMMENT ON TABLE users IS 'User account information';
 COMMENT ON COLUMN users.email IS 'User email address';
 ```
 
-This works automatically with all output modes (interfaces, Zod, metadata).
+This works automatically with all output modes (interfaces, Zod, Drizzle, metadata).
 
 ## Type Mapping
 
@@ -202,6 +322,7 @@ This works automatically with all output modes (interfaces, Zod, metadata).
 | json, jsonb | unknown | z.unknown() |
 | bytea | Buffer | z.instanceof(Buffer) |
 | Arrays (_type) | type[] | z.array(...) |
+| Enums | union type | z.enum() |
 
 ## CLI Reference
 
@@ -226,6 +347,7 @@ Features:
   --with-metadata           Generate table metadata exports
   --zod                     Generate Zod schemas instead of plain interfaces
   --zod-dates               Use z.date() for date/timestamp types (requires --zod)
+  --drizzle                 Generate Drizzle ORM schema (mutually exclusive with --zod)
   -w, --watch               Watch for schema changes and regenerate
   --watch-interval SECONDS  Watch interval in seconds (default: 5)
 ```
@@ -235,6 +357,9 @@ Features:
 ```bash
 # Basic usage
 ./pg2ts.py --url "postgresql://user:pass@localhost/mydb" -o types.ts
+
+# Generate Drizzle ORM schema
+./pg2ts.py --url "..." --drizzle -o schema.ts
 
 # Generate Zod schemas with date coercion
 ./pg2ts.py --url "..." --zod --zod-dates -o schema.ts
@@ -248,7 +373,7 @@ Features:
 # Development: Watch for changes
 ./pg2ts.py --url "..." --watch --watch-interval 3 -o types.ts
 
-# All features combined
+# All features combined (except drizzle)
 ./pg2ts.py --url "..." --zod --with-metadata --json -o types.ts
 ```
 

@@ -12,6 +12,7 @@ Generate TypeScript types from your PostgreSQL database schema. Zero runtime ove
 - **Drizzle ORM** — Generate complete Drizzle schema with relations
 - **JSDoc Comments** — Preserves PostgreSQL COMMENT as JSDoc
 - **Agent-Friendly** — JSON output for automation pipelines
+- **MCP Server** — AI agent integration for Claude, Cursor, etc.
 - **Watch Mode** — Auto-regenerate on schema changes
 
 ## Install
@@ -284,6 +285,65 @@ Output:
   "types_generated": 2,
   "output_file": "types.ts"
 }
+```
+
+### MCP Server (for AI Agents)
+
+pg2ts includes an MCP server for integration with Claude, Cursor, and other AI tools.
+
+**Setup:**
+
+```bash
+pip install fastmcp psycopg2-binary
+```
+
+**Add to Claude Desktop** (`~/.config/claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "pg2ts": {
+      "command": "python",
+      "args": ["/path/to/pg2ts/mcp_server.py"]
+    }
+  }
+}
+```
+
+**Available Tools:**
+
+| Tool | Description |
+|------|-------------|
+| `pg2ts_generate` | Generate TypeScript types (typescript, zod, or drizzle format) |
+| `pg2ts_schema` | Get database schema as JSON (all tables/columns) |
+| `pg2ts_table` | Get detailed info about a specific table |
+
+**Example Usage:**
+
+```
+> What tables are in my database?
+[uses pg2ts_schema]
+
+> Generate TypeScript types for my database
+[uses pg2ts_generate, returns .ts content]
+
+> Show me the users table structure
+[uses pg2ts_table with table="users"]
+```
+
+**Direct Python Usage:**
+
+```python
+from mcp_server import pg2ts_generate, pg2ts_schema, pg2ts_table
+
+# Get all tables as JSON
+schema = pg2ts_schema("postgresql://user:pass@host:5432/db")
+
+# Generate TypeScript
+ts_code = pg2ts_generate("postgresql://...", format="typescript")
+
+# Get specific table
+users = pg2ts_table("postgresql://...", table="users")
 ```
 
 ### Watch Mode (`--watch` / `-w`)

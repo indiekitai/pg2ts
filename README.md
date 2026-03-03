@@ -1,3 +1,5 @@
+[English](README.md) | [中文](README.zh-CN.md)
+
 # pg2ts
 
 Generate TypeScript types from your PostgreSQL database schema. Zero runtime overhead, just pure type generation.
